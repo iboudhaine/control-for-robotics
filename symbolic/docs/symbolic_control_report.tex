@@ -1,0 +1,378 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Symbolic Control Report
+% Part of the Robotics Course Project - UM6P Fall 2025
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\geometry{margin=2.5cm}
+
+% Code listing style
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+\lstdefinestyle{pythonstyle}{
+    backgroundcolor=\color{backcolour},
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    basicstyle=\ttfamily\footnotesize,
+    breaklines=true,
+    captionpos=b,
+    keepspaces=true,
+    language=Python
+}
+\lstset{style=pythonstyle}
+
+\begin{document}
+
+\begin{center}
+    {\LARGE \textbf{Symbolic Control Implementation}}\\[0.5cm]
+    {\large Robotics Course Project --- UM6P, Fall 2025}\\[0.3cm]
+    \rule{0.6\textwidth}{0.4pt}
+\end{center}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Overview}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+This module implements \textbf{Symbolic Control}---a method that abstracts continuous dynamics into a finite-state model to synthesize controllers with formal guarantees. Unlike classical control (PID, MPC), symbolic control can handle complex temporal specifications like ``visit region A, then region B, while always avoiding obstacle O.''
+
+The approach follows a three-step pipeline:
+\begin{enumerate}
+    \item \textbf{Abstraction:} Discretize the continuous state space into a finite grid. For each grid cell and control input, compute an over-approximation of the reachable successor cells.
+    \item \textbf{Synthesis:} Run fixed-point algorithms on the finite model to compute (a) the maximal safe set and (b) the winning set from which the target is reachable.
+    \item \textbf{Concretization:} The resulting controller is a lookup table---given a continuous state, map it to its cell and return the corresponding control.
+\end{enumerate}
+
+The key advantage is \textit{correctness by construction}: if synthesis succeeds, the controller is guaranteed to satisfy the specification for all possible disturbances within the bounded set.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Code Structure}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{verbatim}
+symbolic/
+├── symbolic_control/          # Core library
+│   ├── dynamics.py            # Dynamics models (Integrator, Unicycle, Manipulator)
+│   ├── abstraction.py         # Grid discretization, transition computation
+│   ├── synthesis.py           # Safety + reachability synthesis algorithms
+│   ├── product_synthesis.py   # Product automaton for regex specifications
+│   └── nfa.py                 # Regex to NFA conversion
+├── gui_simple.py              # GUI for safety + reachability (main interface)
+├── gui.py                     # Full GUI with regex/automata specifications
+├── visualize_post.py          # Interactive Post() operator visualizer
+└── README.md                  # Documentation and usage instructions
+\end{verbatim}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Dynamics Models (\texttt{dynamics.py})}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+All dynamics inherit from an abstract \texttt{Dynamics} base class that requires two methods:
+\begin{itemize}
+    \item \texttt{post(x\_lo, x\_hi, u)}: Returns over-approximated successor bounds $[\text{succ\_lo}, \text{succ\_hi}]$
+    \item \texttt{step(x, u, w)}: Returns exact next state (used for simulation)
+\end{itemize}
+
+\subsection{2D Integrator}
+
+Simple velocity-controlled point robot:
+\[
+x(t+1) = x(t) + \tau \cdot (u + w), \quad x \in \mathbb{R}^2
+\]
+
+This system is \textbf{monotone}---the successor is monotonically increasing in both $x$ and $w$. This allows exact interval arithmetic:
+\begin{lstlisting}
+def post(self, x_lo, x_hi, u):
+    succ_lo = self.step(x_lo, u, self.w_min)  # Min disturbance
+    succ_hi = self.step(x_hi, u, self.w_max)  # Max disturbance
+    return succ_lo, succ_hi
+\end{lstlisting}
+
+\subsection{3D Unicycle}
+
+Non-holonomic mobile robot with position and heading:
+\[
+\begin{pmatrix} x_1 \\ x_2 \\ \theta \end{pmatrix}_{t+1} = 
+\begin{pmatrix} x_1 + \tau \cdot v \cos\theta \\ x_2 + \tau \cdot v \sin\theta \\ \theta + \tau \cdot \omega \end{pmatrix} + \tau \cdot w
+\]
+
+This system is \textbf{non-monotone} due to $\sin/\cos$ terms. We use Jacobian-based growth bounds:
+\begin{lstlisting}
+def post(self, x_lo, x_hi, u):
+    x_center = (x_lo + x_hi) / 2
+    delta_x = (x_hi - x_lo) / 2
+    f_center = self.step(x_center, u, np.zeros(3))
+    
+    # Jacobian bounds: |df/dx| and |df/dw|
+    growth = d_x @ delta_x + d_w @ delta_w
+    
+    return f_center - growth, f_center + growth
+\end{lstlisting}
+
+\subsection{4D Robotic Manipulator}
+
+Two-link planar arm with state $(\theta_1, \theta_2, \dot\theta_1, \dot\theta_2)$:
+\[
+M(\theta)\ddot{\theta} + c(\theta, \dot{\theta}) + g(\theta) = \tau
+\]
+
+This system is highly nonlinear with coupled dynamics. We use \textbf{sampling-based over-approximation}: sample the cell corners and center, compute successors for each, then take the bounding box with a Lipschitz margin.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Abstraction (\texttt{abstraction.py})}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+The \texttt{Abstraction} class discretizes the state space and computes transitions.
+
+\subsection{Grid Construction}
+
+Given state bounds and discretization parameter $\eta$ (can be per-dimension), the grid is constructed:
+\begin{lstlisting}
+self.grid_shape = tuple(
+    int(np.ceil((bounds[d,1] - bounds[d,0]) / eta[d]))
+    for d in range(state_dim)
+)
+self.num_cells = np.prod(self.grid_shape)
+\end{lstlisting}
+
+For example, a $[0,10] \times [0,10]$ space with $\eta=0.5$ gives a $20 \times 20 = 400$ cell grid.
+
+\subsection{Transition Computation}
+
+For each cell and control input, we compute transitions:
+\begin{lstlisting}
+def build_transitions(self):
+    for cell_idx in range(self.num_cells):
+        x_lo, x_hi = self.cell_to_bounds(cell_idx)
+        for u_idx, u in enumerate(self.dynamics.control_set):
+            succ_lo, succ_hi = self.dynamics.post(x_lo, x_hi, u)
+            succ_cells = self.bounds_to_cells(succ_lo, succ_hi)
+            self.transitions[(cell_idx, u_idx)] = succ_cells
+\end{lstlisting}
+
+The \texttt{bounds\_to\_cells} method finds all grid cells that overlap with the successor bounding box. If the successor extends outside the grid, it returns an empty set (unsafe transition).
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Synthesis (\texttt{synthesis.py})}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+The synthesis module implements a two-phase algorithm.
+
+\subsection{Phase 1: Safety Synthesis}
+
+Compute the maximal controlled invariant set $S^*$---the largest set of cells from which the system can stay safe forever:
+
+\begin{lstlisting}
+def compute_safe_automaton(abstraction, safe_spec):
+    safe_set = safe_spec.copy()
+    while True:
+        new_safe = set()
+        for cell in safe_spec:
+            # Cell is safe if exists u: Post(cell, u) subset of safe_set
+            for u_idx in range(num_controls):
+                successors = transitions[(cell, u_idx)]
+                if successors and successors.issubset(safe_set):
+                    new_safe.add(cell)
+                    break
+        if new_safe == safe_set:
+            break
+        safe_set = new_safe
+    return safe_set
+\end{lstlisting}
+
+\subsection{Phase 2: Reachability Synthesis}
+
+On the safe automaton, compute the winning set---cells from which the target is reachable:
+
+\begin{lstlisting}
+def compute_reachability(safe_automaton, target):
+    reach_set = target & safe_automaton.safe_states
+    while True:
+        new_reach = reach_set.copy()
+        for cell in safe_automaton.safe_states:
+            for u_idx in range(num_controls):
+                successors = safe_automaton.get_successors(cell, u_idx)
+                if successors and successors.issubset(reach_set):
+                    new_reach.add(cell)
+                    break
+        if new_reach == reach_set:
+            break
+        reach_set = new_reach
+    return reach_set
+\end{lstlisting}
+
+\subsection{Controller Extraction}
+
+The controller maps each winning cell to valid controls. For cells not at the target, we select controls whose successors are in a ``closer'' reachability layer:
+
+\begin{lstlisting}
+def get_control(self, cell_idx):
+    if cell_idx not in self.controller:
+        return None
+    return random.choice(self.controller[cell_idx])
+\end{lstlisting}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{GUI Applications}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\subsection{Simple Synthesis GUI (\texttt{gui\_simple.py})}
+
+The main interface for safety + reachability synthesis:
+
+\textbf{Left Panel:}
+\begin{itemize}
+    \item \textbf{Model Selection:} Choose Integrator or Unicycle dynamics
+    \item \textbf{Parameters:} Sampling period $\tau$, disturbance bound, state bounds
+    \item \textbf{Discretization:} Per-dimension $\eta$ values
+    \item \textbf{Control:} Min/max values and number of discrete points
+    \item \textbf{Drawing Mode:} Toggle between drawing obstacles and target
+\end{itemize}
+
+\textbf{Right Panel:}
+\begin{itemize}
+    \item Grid visualization with obstacles (red) and target (green)
+    \item After synthesis: winning set (blue gradient by distance to target)
+    \item Click to set start position and simulate trajectory
+\end{itemize}
+
+\textbf{Workflow:}
+\begin{enumerate}
+    \item Configure parameters and discretization
+    \item Draw obstacles by clicking and dragging
+    \item Draw target region (green)
+    \item Click ``Run Synthesis''
+    \item Click on any blue cell to simulate from that position
+\end{enumerate}
+
+\subsection{Full GUI with Regex (\texttt{gui.py})}
+
+Extends the simple GUI with support for regular language specifications:
+\begin{itemize}
+    \item Define named regions (A, B, O, etc.) with coordinates
+    \item Enter regex specification like \texttt{A(.*B)} (visit A then eventually B)
+    \item Uses product automaton synthesis from \texttt{product\_synthesis.py}
+\end{itemize}
+
+\subsection{Post() Visualizer (\texttt{visualize\_post.py})}
+
+Interactive tool to understand the over-approximation:
+\begin{itemize}
+    \item Adjust $\eta$ with a slider and click ``Discretize''
+    \item Select $\theta$ index (for unicycle) and control input
+    \item Click on any cell to see its successor cells highlighted
+    \item Shows both the selected cell (blue) and successor cells (orange)
+\end{itemize}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Usage Examples}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\subsection{Running the GUI}
+
+\begin{verbatim}
+# Install dependencies
+pip install numpy matplotlib tqdm
+
+# Run simple GUI (recommended)
+python gui_simple.py
+
+# Run full GUI with regex specifications
+python gui.py
+
+# Visualize Post() operator
+python visualize_post.py
+\end{verbatim}
+
+\subsection{Programmatic Usage}
+
+\begin{lstlisting}
+from symbolic_control import IntegratorDynamics, Abstraction, Synthesis
+import numpy as np
+
+# 1. Create dynamics
+dynamics = IntegratorDynamics(tau=0.4, w_bound=0.01,
+                               u_values=np.linspace(-1, 1, 5))
+
+# 2. Create abstraction
+bounds = np.array([[0, 10], [0, 10]])
+abstraction = Abstraction(dynamics, bounds, eta=0.5)
+abstraction.build_transitions()
+
+# 3. Define obstacles and target (as cell index sets)
+obstacles = {...}  # Cells to avoid
+target = {...}     # Cells to reach
+
+# 4. Run synthesis
+synth = Synthesis(abstraction, obstacles, target)
+winning_set = synth.run()
+
+# 5. Query controller
+cell = abstraction.point_to_cell(np.array([2.0, 3.0]))
+u_idx = synth.get_control(cell)
+u = dynamics.control_set[u_idx]
+\end{lstlisting}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Comparison with Other Approaches}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\toprule
+Property & Symbolic & Classical (MPC) & RL \\
+\midrule
+Formal guarantees & \checkmark & $\sim$ & $\times$ \\
+Complex temporal specs & \checkmark & $\times$ & $\sim$ \\
+Handles disturbances & \checkmark & \checkmark & $\sim$ \\
+Scalability (high-dim) & $\times$ & \checkmark & \checkmark \\
+Requires model & \checkmark & \checkmark & $\times$ \\
+Online computation & $\times$ & \checkmark & \checkmark \\
+\bottomrule
+\end{tabular}
+\caption{Comparison of control approaches}
+\end{table}
+
+\textbf{Advantages:}
+\begin{itemize}
+    \item Controllers are \textit{correct by construction}
+    \item Handles rich specifications (safety, reachability, temporal logic)
+    \item Explicitly accounts for bounded disturbances
+    \item Model-agnostic: works with any dynamics implementing \texttt{post()}/\texttt{step()}
+\end{itemize}
+
+\textbf{Limitations:}
+\begin{itemize}
+    \item \textit{Curse of dimensionality}: grid size grows as $O\left(\prod_d \frac{\Delta_d}{\eta_d}\right)$
+    \item Conservative: over-approximation may reject valid controls
+    \item Offline: all transitions must be precomputed before synthesis
+\end{itemize}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section{Code Availability}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+The complete implementation is available in the \texttt{symbolic/} folder of the project's GitHub repository. This includes:
+\begin{itemize}
+    \item Full source code for the symbolic control library (\texttt{symbolic\_control/})
+    \item Interactive GUI applications (\texttt{gui\_simple.py}, \texttt{gui.py})
+    \item Post() visualization tool (\texttt{visualize\_post.py})
+    \item A \texttt{README.md} with installation instructions and usage guide
+    \item A demo video showcasing the synthesis and simulation workflow
+\end{itemize}
+
+\end{document}
+
+\end{document}
