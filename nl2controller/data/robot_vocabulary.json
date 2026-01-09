@@ -1,0 +1,63 @@
+{
+  "metadata": {
+    "robot_name": "PatrolBot",
+    "version": "1.0.0",
+    "description": "Variable dictionary for a mobile patrol robot"
+  },
+  "variables": {
+    "locations": {
+      "zone a": "at_zone_a",
+      "zone b": "at_zone_b",
+      "zone c": "at_zone_c",
+      "charging station": "at_charging_station",
+      "home": "at_home",
+      "entrance": "at_entrance",
+      "exit": "at_exit"
+    },
+    "sensors": {
+      "low battery": "battery_low",
+      "battery low": "battery_low",
+      "critical battery": "battery_critical",
+      "battery full": "battery_full",
+      "obstacle detected": "obstacle_detected",
+      "obstacle": "obstacle_detected",
+      "person detected": "person_detected",
+      "person": "person_detected",
+      "door open": "door_open",
+      "door closed": "door_closed",
+      "red light": "light_red",
+      "green light": "light_green",
+      "yellow light": "light_yellow"
+    },
+    "actions": {
+      "patrol": "patrolling",
+      "stop": "stopped",
+      "move": "moving",
+      "charge": "charging",
+      "recharge": "charging",
+      "alert": "alerting",
+      "alarm": "alerting",
+      "wait": "waiting"
+    },
+    "conditions": {
+      "safe": "safe",
+      "danger": "danger",
+      "emergency": "emergency",
+      "night mode": "night_mode",
+      "day mode": "day_mode"
+    }
+  },
+  "aliases": {
+    "area a": "zone a",
+    "area b": "zone b", 
+    "area c": "zone c",
+    "sector a": "zone a",
+    "sector b": "zone b",
+    "sector c": "zone c",
+    "base": "charging station",
+    "dock": "charging station",
+    "patrol zone a": "zone a",
+    "patrol zone b": "zone b",
+    "patrol zone c": "zone c"
+  }
+}
