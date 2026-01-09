@@ -1,0 +1,1 @@
+This repository explores and compares various control strategies, including classical path tracking (LQR, Pole Placement, Feedback Linearization), symbolic control (regex), and reinforcement learning, applied to integrator, unicycle, and robotic manipulator models. The repository includes the simulation code, visualizations of the results, and the final project report.
