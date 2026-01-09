@@ -666,15 +666,5 @@ def run_all_experiments():
 
 if __name__ == "__main__":
     # Run all experiments
-    figures = run_all_experiments()
+    run_all_experiments()
     
-    # Save all figures
-    print("\nSaving figures...")
-    for exp_type, system_name, fig in figures:
-        filename = f"/home/claude/{exp_type}_{system_name.replace(' ', '_').lower()}.png"
-        fig.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"   Saved: {filename}")
-    
-    plt.show()
-    
-    print("\n✓ All results saved successfully!")
