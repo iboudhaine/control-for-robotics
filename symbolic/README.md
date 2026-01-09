@@ -4,8 +4,7 @@ A Python implementation of **Symbolic Control** for nonlinear dynamical systems.
 
 ## 📹 Demo
 
-
-![](./attachments/gui%20demo.mp4)
+https://github.com/user-attachments/assets/bb76446c-4d5f-4a19-ab58-dbe8937e7217
 
 ---
 
